@@ -1,15 +1,17 @@
-// Boots the real game under its GitHub Pages origin, while serving the checked-in
-// files locally. No production deployment or third-party network access is needed.
+// Boots the real game under its GitHub Pages or jsDelivr origin, while serving
+// the checked-in files locally. No production deployment or network is needed.
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('playwright-core');
 
 const root = path.join(__dirname, '..');
-const origin = 'https://thealphaleopard.github.io';
-const prefix = '/megamix/';
+const svgMode = process.argv.includes('--svg');
+const origin = svgMode ? 'https://cdn.jsdelivr.net' : 'https://thealphaleopard.github.io';
+const prefix = svgMode ? '/gh/TheAlphaLeopard/megamix/' : '/megamix/';
+const pageName = svgMode ? 'loader.svg' : 'index.html';
 const touchMode = process.argv.includes('--touch');
-const allowed = /^(?:index\.html|dataloader\.js|RSDKv5U\.(?:js|wasm|data(?:\.manifest\.json)?)|chunks\/RSDKv5U\.data\.p\d{3})$/;
+const allowed = /^(?:index\.html|loader\.svg|dataloader\.js|RSDKv5U\.(?:js|wasm|data(?:\.manifest\.json)?)|chunks\/RSDKv5U\.data\.p\d{3})$/;
 
 // These addresses apply only to the exact, checksum-guarded engine in this
 // repository. They let the test time the tutorial portal jump and inspect the
@@ -32,8 +34,26 @@ async function tap(page, name, duration = 120) {
   await key(page, name, false);
 }
 
+// Exercise hit testing with an actual touchscreen contact, not just a DOM
+// event dispatched straight to the element (which could be hidden or covered).
+async function touchscreenPress(page, selector, duration = 120) {
+  const box = await page.locator(selector).boundingBox();
+  assert.ok(box && box.width > 0 && box.height > 0, `Touch target has no box: ${selector}`);
+  const session = await page.context().newCDPSession(page);
+  try {
+    await session.send('Input.dispatchTouchEvent', {
+      type: 'touchStart', touchPoints: [{ x: box.x + box.width / 2, y: box.y + box.height / 2, id: 0 }],
+    });
+    await page.waitForTimeout(duration);
+    await session.send('Input.dispatchTouchEvent', { type: 'touchEnd', touchPoints: [] });
+  } finally {
+    await session.detach();
+  }
+}
+
 function contentType(name) {
   if (name.endsWith('.html')) return 'text/html';
+  if (name.endsWith('.svg')) return 'image/svg+xml';
   if (name.endsWith('.js')) return 'application/javascript';
   if (name.endsWith('.wasm')) return 'application/wasm';
   if (name.endsWith('.json')) return 'application/json';
@@ -83,6 +103,7 @@ async function main() {
   const unexpectedRequests = [];
   const pageErrors = [];
   const requests = [];
+  const requestUrls = [];
   page.on('pageerror', error => pageErrors.push(error.stack || error.message));
   page.on('crash', () => pageErrors.push('Browser tab crashed'));
 
@@ -91,14 +112,15 @@ async function main() {
       const request = route.request();
       const url = new URL(request.url());
       if (url.origin !== origin || !url.pathname.startsWith(prefix)) {
-        // Fonts are cosmetic and not necessary to start the game.
-        if (url.hostname !== 'fonts.googleapis.com' && url.hostname !== 'fonts.gstatic.com') {
+        // The HTML launcher uses optional Google fonts; the SVG does not.
+        if (svgMode || (url.hostname !== 'fonts.googleapis.com' && url.hostname !== 'fonts.gstatic.com')) {
           unexpectedRequests.push(request.url());
         }
         return route.abort();
       }
       const name = decodeURIComponent(url.pathname.slice(prefix.length)) || 'index.html';
       requests.push(`${request.method()} ${name}`);
+      requestUrls.push(request.url());
       if (!allowed.test(name)) return route.fulfill({ status: 404 });
       const file = path.join(root, name);
       if (!fs.existsSync(file)) return route.fulfill({ status: 404 });
@@ -108,9 +130,40 @@ async function main() {
       return route.fulfill({ path: file, contentType: contentType(name) });
     });
 
-    console.log('Loading the game using the GitHub Pages origin...');
-    await page.goto(origin + prefix, { waitUntil: 'domcontentloaded', timeout: 120000 });
+    console.log(`Loading ${origin + prefix + (svgMode ? pageName : '')} with local game files...`);
+    await page.goto(origin + prefix + (svgMode ? pageName : ''), { waitUntil: 'domcontentloaded', timeout: 120000 });
+    if (svgMode) {
+      assert.deepEqual(await page.evaluate(() => ({
+        contentType: document.contentType,
+        root: document.documentElement.localName,
+        namespace: document.documentElement.namespaceURI,
+        parseErrors: document.getElementsByTagName('parsererror').length,
+        bodies: document.querySelectorAll('body').length,
+        bodyContainsGame: document.body && document.body.contains(document.getElementById('canvas')),
+      })), {
+        contentType: 'image/svg+xml', root: 'svg',
+        namespace: 'http://www.w3.org/2000/svg', parseErrors: 0,
+        bodies: 1, bodyContainsGame: true,
+      });
+    }
     await page.waitForFunction(() => document.body.classList.contains('engine-ready'), null, { timeout: 120000 });
+    if (svgMode) {
+      const loaderUrl = requestUrls.map(url => new URL(url)).find(url => url.pathname === prefix + 'dataloader.js');
+      assert.ok(loaderUrl && loaderUrl.searchParams.has('v'), 'SVG must use a fresh dataloader cache key');
+    }
+    assert.ok(await page.locator('#fs-btn').isVisible(), 'Fullscreen button must be visible after startup');
+    if (touchMode) {
+      assert.ok(await page.locator('#touch-controls .btn-start').isVisible(), 'Touch START button must be visible');
+    }
+    if (svgMode) {
+      await page.locator('#fs-btn').click();
+      await page.waitForFunction(() => document.fullscreenElement === document.documentElement, null, { timeout: 5000 });
+      if (touchMode) {
+        assert.ok(await page.locator('#touch-controls .btn-start').isVisible(), 'Touch controls must remain available in fullscreen');
+      }
+      await page.locator('#fs-btn').click();
+      await page.waitForFunction(() => !document.fullscreenElement, null, { timeout: 5000 });
+    }
     assert.equal(await page.evaluate(() => Module.FS.stat('/Data.rsdk').size), 247953543);
     assert.equal(await page.evaluate(() => Module.FS.readlink('/idbfs/Data.rsdk')), '/Data.rsdk');
     assert.equal(requests.filter(request => request.startsWith('GET chunks/')).length, 14);
@@ -179,7 +232,8 @@ async function main() {
     await page.waitForFunction(({ address, x }) => HEAP32[address >> 2] / 65536 > x + 30,
       { address: playerPosition, x: startX }, { timeout: 6000 });
     await key(page, 'ArrowRight', false);
-    await tap(page, 'Enter');
+    if (touchMode) await touchscreenPress(page, '#touch-controls .btn-start');
+    else await tap(page, 'Enter');
     await page.waitForFunction(address => HEAPU8[address + 54] === 3, sceneInfo, { timeout: 5000 });
     await page.waitForTimeout(1500);
     await tap(page, 'a');
