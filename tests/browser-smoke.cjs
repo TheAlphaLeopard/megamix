@@ -11,6 +11,27 @@ const prefix = '/megamix/';
 const touchMode = process.argv.includes('--touch');
 const allowed = /^(?:index\.html|dataloader\.js|RSDKv5U\.(?:js|wasm|data(?:\.manifest\.json)?)|chunks\/RSDKv5U\.data\.p\d{3})$/;
 
+// These addresses apply only to the exact, checksum-guarded engine in this
+// repository. They let the test time the tutorial portal jump and inspect the
+// loaded scene; they are not a general interface for other RSDK builds.
+const playerPosition = 17673188;
+const sceneInfo = 8878812;
+const currentFolder = 12957088;
+
+async function key(page, name, down) {
+  if (!touchMode) return down ? page.keyboard.down(name) : page.keyboard.up(name);
+  const selectors = {
+    a: '.btn-a', Enter: '.btn-start', ArrowLeft: '.left', ArrowRight: '.right',
+  };
+  await page.locator('#touch-controls ' + selectors[name]).dispatchEvent(down ? 'touchstart' : 'touchend');
+}
+
+async function tap(page, name, duration = 120) {
+  await key(page, name, true);
+  await page.waitForTimeout(duration);
+  await key(page, name, false);
+}
+
 function contentType(name) {
   if (name.endsWith('.html')) return 'text/html';
   if (name.endsWith('.js')) return 'application/javascript';
@@ -109,14 +130,7 @@ async function main() {
     let sawSaveSelect = false;
     let reachedTutorial = false;
     for (let i = 0; i < 14 && !reachedTutorial; i++) {
-      if (touchMode) {
-        const button = page.locator('#touch-controls .btn-a');
-        await button.dispatchEvent('touchstart');
-        await page.waitForTimeout(250);
-        await button.dispatchEvent('touchend');
-      } else {
-        await page.keyboard.press('a', { delay: 250 });
-      }
+      await tap(page, 'a', 250);
       await page.waitForTimeout(5000);
       colors = await screenColors(page);
       if (colors.lavender > 0.50 && colors.blue > 0.05) sawSaveSelect = true;
@@ -127,6 +141,50 @@ async function main() {
     assert.deepEqual(unexpectedRequests, [], 'Game should not depend on a third-party site check');
     assert.deepEqual(pageErrors, [], 'Game produced an uncaught browser error');
     console.log('Reached save select and the tutorial level without errors.');
+
+    await page.waitForFunction(() => window.__MMX_TUTORIAL_COMPAT__ === 'active', null, { timeout: 15000 });
+    // The first portal is at x=1536; approach from the right and jump into it.
+    // Waiting for position rather than wall-clock timing makes this stable at
+    // different rendering speeds. The portal takes a moment to open.
+    await page.waitForTimeout(4000);
+    await key(page, 'ArrowLeft', true);
+    await page.waitForFunction(address => HEAP32[address >> 2] / 65536 < 1610, playerPosition, { timeout: 15000 });
+    await tap(page, 'a');
+    await page.waitForFunction(address => HEAP32[address >> 2] / 65536 < 1540, playerPosition, { timeout: 6000 });
+    await key(page, 'ArrowLeft', false);
+    await page.waitForFunction(() => window.__MMX_TUTORIAL_COMPAT__ === 'redirected', null, { timeout: 15000 });
+    await page.waitForFunction(({ scene, folder }) =>
+      HEAPU8[scene + 52] === 1 && HEAPU16[(scene + 24) >> 1] === 6 &&
+      HEAPU8[folder] === 71 && HEAPU8[folder + 1] === 72 && HEAPU8[folder + 2] === 90 &&
+      HEAP32[(scene + 48) >> 2] === 1 && HEAPU8[scene + 57] >= 8,
+    { scene: sceneInfo, folder: currentFolder }, { timeout: 40000 });
+    const firstActLog = await page.evaluate(() => Module.FS.readFile('/idbfs/log.txt', { encoding: 'utf8' }));
+    assert.match(firstActLog, /Loading Scene "Mania Mode - Sunny Shores Zone 1"/);
+    assert.doesNotMatch(firstActLog, /Loading Scene "Cutscenes - Intro 2"/);
+    assert.match(firstActLog, /Loaded data file Data\/Music\/SunnyShores1\.ogg/);
+    colors = await screenColors(page);
+    assert.ok(colors.blue > 0.05 && colors.orange > 0.05,
+      `First zone did not render its expected scenery: ${JSON.stringify(colors)}`);
+
+    // Exercise the actual gameplay controls. In particular touch A must not
+    // send Enter as well: Enter pauses the level instead of jumping.
+    const startY = await page.evaluate(address => HEAP32[(address >> 2) + 1] / 65536, playerPosition);
+    await key(page, 'a', true);
+    await page.waitForFunction(({ address, y }) => HEAP32[(address >> 2) + 1] / 65536 < y - 5,
+      { address: playerPosition, y: startY }, { timeout: 3000 });
+    await key(page, 'a', false);
+    assert.equal(await page.evaluate(address => HEAPU8[address + 54], sceneInfo), 1, 'Jump unexpectedly paused the game');
+    const startX = await page.evaluate(address => HEAP32[address >> 2] / 65536, playerPosition);
+    await key(page, 'ArrowRight', true);
+    await page.waitForFunction(({ address, x }) => HEAP32[address >> 2] / 65536 > x + 30,
+      { address: playerPosition, x: startX }, { timeout: 6000 });
+    await key(page, 'ArrowRight', false);
+    await tap(page, 'Enter');
+    await page.waitForFunction(address => HEAPU8[address + 54] === 3, sceneInfo, { timeout: 5000 });
+    await page.waitForTimeout(1500);
+    await tap(page, 'a');
+    await page.waitForFunction(address => HEAPU8[address + 54] === 1, sceneInfo, { timeout: 5000 });
+    console.log('Skipped the tutorial and played Sunny Shores with a running timer.');
 
     const savedKeys = await page.evaluate(async () => {
       await new Promise((resolve, reject) => Module.FS.syncfs(false, error => error ? reject(error) : resolve()));
@@ -143,6 +201,51 @@ async function main() {
     });
     assert.ok(savedKeys.includes('/idbfs/SaveData.bin'), 'Game save was not persisted to IndexedDB');
     console.log('Game save persisted to IndexedDB.');
+
+    // Reload the same browser context and select the existing save. It should
+    // resume in the first zone rather than repeat the tutorial or enter Intro 2.
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 120000 });
+    await page.waitForFunction(() => document.body.classList.contains('engine-ready'), null, { timeout: 120000 });
+    await page.locator('#canvas').click({ position: { x: 25, y: 25 } });
+    const reloadTitleDeadline = Date.now() + 70000;
+    do {
+      await page.waitForTimeout(2000);
+      colors = await screenColors(page);
+    } while (!(colors.blue > 0.30 && colors.black < 0.15) && Date.now() < reloadTitleDeadline);
+    assert.ok(colors.blue > 0.30 && colors.black < 0.15, 'Title screen did not return after reload');
+    let resumedFirstAct = false;
+    for (let i = 0; i < 14 && !resumedFirstAct; i++) {
+      await tap(page, 'a', 250);
+      await page.waitForTimeout(4000);
+      resumedFirstAct = await page.evaluate(({ scene, folder }) =>
+        HEAPU8[scene + 52] === 1 && HEAPU16[(scene + 24) >> 1] === 6 &&
+        HEAPU8[folder] === 71 && HEAPU8[folder + 1] === 72 && HEAPU8[folder + 2] === 90,
+      { scene: sceneInfo, folder: currentFolder });
+    }
+    assert.ok(resumedFirstAct, 'The persisted save did not resume in Sunny Shores');
+    await page.waitForFunction(address => HEAP32[(address + 48) >> 2] === 1, sceneInfo, { timeout: 25000 });
+    console.log('Reloaded the saved game in Sunny Shores.');
+
+    // Diagnostic shortcut: move the player to the first act's signpost. This
+    // checks the act transition, but deliberately does not claim that the
+    // entire level is playable or that later mod-specific objects work.
+    await page.evaluate(address => {
+      HEAP32[address >> 2] = 24840 * 65536;
+      HEAP32[(address >> 2) + 1] = 680 * 65536;
+    }, playerPosition);
+    await key(page, 'ArrowRight', true);
+    await page.waitForFunction(({ scene, folder }) =>
+      HEAPU8[scene + 52] === 1 && HEAPU16[(scene + 24) >> 1] === 7 &&
+      HEAPU8[folder] === 80 && HEAPU8[folder + 1] === 83 && HEAPU8[folder + 2] === 90 && HEAPU8[folder + 3] === 49,
+    { scene: sceneInfo, folder: currentFolder }, { timeout: 50000 });
+    await key(page, 'ArrowRight', false);
+    await page.waitForFunction(address => HEAP32[(address + 48) >> 2] === 1 && HEAPU8[address + 57] >= 1,
+      sceneInfo, { timeout: 25000 });
+    const progressionLog = await page.evaluate(() => Module.FS.readFile('/idbfs/log.txt', { encoding: 'utf8' }));
+    assert.match(progressionLog, /Loading Scene "Mania Mode - 2"/);
+    assert.deepEqual(unexpectedRequests, [], 'Game should not depend on a third-party site check');
+    assert.deepEqual(pageErrors, [], 'Game produced an uncaught browser error');
+    console.log('The first act signpost led to act 2 (using a diagnostic teleport).');
 
     // A fatal error after the splash screen must be visible instead of leaving
     // the user with an unexplained frozen/black canvas.

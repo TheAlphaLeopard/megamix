@@ -317,6 +317,140 @@
     };
   });
 
+  /* The bundled data's tutorial portal advances to Cutscenes/Intro 2, whose
+   * scene and stage configuration do not match. In this engine build that
+   * leaves the player in the broken, empty scene. As a limited workaround,
+   * redirect that one transition to the first Mania Mode scene instead. This
+   * skips the intro cutscene; it does not implement the mod's missing game
+   * logic or make the decomp port fully compatible.
+   *
+   * These offsets are specific to the checked-in WASM. We only install the
+   * watcher when the EXACT wasm and the relevant archive records have been
+   * SHA-256 checked, then verify the live scene table and transition flags
+   * before writing anything. Custom data overrides and custom engine loaders
+   * are deliberately left alone. See tests/tutorial-compat.test.cjs and the
+   * browser test before changing either engine or game data. */
+  var tutorialEngineVerified = false;
+  var TUTORIAL_WASM_SHA256 = "b4a62ae8381fd1dc8e9c7837f16bb1b654cdd0e4ddb76981f40c48819ef69fb8";
+  var TUTORIAL_DATA_SIZE = 247953543;
+  var tutorialDataChecks = [
+    // GameConfig, broken ERZ/Scene1, ERZ/StageConfig, GHZ/Scene1.
+    [57728, 5423, "be84c58285405514d5cb555f3d3415507e6f4293234c8162923c64570f95f52f"],
+    [126904929, 29686, "448e493d3b3d1edcef500f7c9ca6fa84b757d6499b4ca289513622d626c38d15"],
+    [127019325, 3447, "929b411ede6e96d0ddcd771921bbec0a121858c571c43d0178b324ca1c01c9e0"],
+    [127097011, 140717, "a014d7901a782495e575c48b42e635ee9e4731f373440a51859de5c17625d9e9"]
+  ];
+  window.__MMX_TUTORIAL_COMPAT__ = "unavailable"; // Diagnostic state, not a game API.
+
+  async function tutorialSha256(bytes) {
+    var digest = await window.crypto.subtle.digest("SHA-256", bytes);
+    return Array.from(new Uint8Array(digest), function (b) {
+      return b.toString(16).padStart(2, "0");
+    }).join("");
+  }
+
+  async function verifiedTutorialEngine() {
+    if (!window.crypto || !window.crypto.subtle || dataOverride || Module.wasmBinary ||
+        Module.instantiateWasm || Module.locateFile) return null;
+    try {
+      // Supply the very bytes we verify to Emscripten, rather than hashing a
+      // second response that might not be the engine the browser actually ran.
+      var response = await fetch(mmxJoin(WASM_FILE));
+      if (!response.ok) throw new Error("engine fetch failed: " + response.status);
+      var bytes = await response.arrayBuffer();
+      if (await tutorialSha256(bytes) !== TUTORIAL_WASM_SHA256) {
+        throw new Error("engine checksum differs from the supported build");
+      }
+      return bytes;
+    } catch (e) {
+      console.warn("[dataloader] Tutorial transition workaround unavailable:", e);
+      return null;
+    }
+  }
+
+  async function verifiedTutorialData() {
+    var fs = Module.FS;
+    if (!fs || fs.stat("/Data.rsdk").size !== TUTORIAL_DATA_SIZE) return false;
+    var stream = fs.open("/Data.rsdk", "r");
+    var fragments = [];
+    try {
+      for (var i = 0; i < tutorialDataChecks.length; i++) {
+        var check = tutorialDataChecks[i];
+        var bytes = new Uint8Array(check[1]);
+        if (fs.read(stream, bytes, 0, bytes.length, check[0]) !== bytes.length) return false;
+        fragments.push(bytes);
+      }
+    } finally {
+      fs.close(stream);
+    }
+    var hashes = await Promise.all(fragments.map(tutorialSha256));
+    return hashes.every(function (hash, index) { return hash === tutorialDataChecks[index][2]; });
+  }
+
+  function createTutorialTransitionWatcher() {
+    var sawTutorial = false;
+    return function () {
+      var heap = window.HEAPU8;
+      // Addresses of SceneInfo*, globals*, and currentSceneFolder in this WASM.
+      var scenePointer = 21562544, globalsPointer = 21563912, folderAddress = 12957088;
+      if (!heap || heap.byteLength < globalsPointer + 4) return;
+      var view = new DataView(heap.buffer, heap.byteOffset, heap.byteLength);
+      var scene = view.getUint32(scenePointer, true);
+      if (scene !== 8878812 || scene + 59 > heap.byteLength) return;
+      var category = heap[scene + 52], position = view.getUint16(scene + 24, true);
+
+      function matches(address, text, capacity) {
+        if (address < 0 || address + capacity > heap.byteLength || text.length >= capacity) return false;
+        for (var i = 0; i < text.length; i++) {
+          if (heap[address + i] !== text.charCodeAt(i)) return false;
+        }
+        return heap[address + text.length] === 0;
+      }
+
+      // The folder is the scene actually loaded, not just the next list entry.
+      if (category !== 6 || !matches(folderAddress, "TUTORIAL", 16)) {
+        sawTutorial = false;
+        return;
+      }
+      if (position === 166) {
+        sawTutorial = true;
+        return;
+      }
+      if (!sawTutorial || position !== 167 || heap[scene + 54] > 1 ||
+          heap[scene + 53] <= 6 || heap[scene + 55] !== 3) return;
+
+      var categories = view.getUint32(scene + 8, true);
+      var scenes = view.getUint32(scene + 4, true);
+      if (!categories || !scenes || categories + 7 * 56 > heap.byteLength ||
+          scenes + 168 * 76 > heap.byteLength) return;
+      var mania = categories + 56, cutscenes = categories + 6 * 56;
+      var first = scenes + 6 * 76, intro = scenes + 166 * 76, next = scenes + 167 * 76;
+      if (!matches(mania + 16, "Mania Mode", 32) || view.getUint16(mania + 48, true) !== 6 ||
+          view.getUint16(mania + 50, true) < 6 ||
+          !matches(cutscenes + 16, "Cutscenes", 32) || view.getUint16(cutscenes + 48, true) !== 166 ||
+          view.getUint16(cutscenes + 50, true) < 167 ||
+          !matches(intro + 16, "Intro", 32) || !matches(intro + 48, "TUTORIAL", 16) ||
+          !matches(next + 16, "Intro 2", 32) || !matches(next + 48, "ERZ", 16) ||
+          !matches(first + 16, "Sunny Shores Zone 1", 32) || !matches(first + 48, "GHZ", 16) ||
+          !matches(first + 64, "1", 8)) return;
+
+      // RubyPortal sets these for the intro cutscene. Clear both for a normal
+      // level start so its title card, stage music, and timer work as expected.
+      var globals = view.getUint32(globalsPointer, true), suppressTitlecard = 200876;
+      if (!globals || (globals & 3) || globals + suppressTitlecard + 8 > heap.byteLength ||
+          view.getInt32(globals, true) !== 0 || // Mania Mode, not Encore/Time Attack/Competition.
+          view.getInt32(globals + suppressTitlecard, true) !== 1 ||
+          view.getInt32(globals + suppressTitlecard + 4, true) !== 1) return;
+      view.setInt32(globals + suppressTitlecard, 0, true);
+      view.setInt32(globals + suppressTitlecard + 4, 0, true);
+      view.setUint16(scene + 24, 6, true);
+      heap[scene + 52] = 1;
+      sawTutorial = false;
+      window.__MMX_TUTORIAL_COMPAT__ = "redirected";
+      console.log("[dataloader] Redirected the tutorial portal to Sunny Shores Zone 1.");
+    };
+  }
+
   /* --- IDBFS save persistence ---
    * Sonic Mania writes UserDB and save files to its working directory. We mount
    * IndexedDB-backed storage at /idbfs so writes survive tab close. Engine sees
@@ -437,11 +571,32 @@
 
   Module.postRun = Module.postRun || [];
   Module.postRun.push(function () {
+    if (!tutorialEngineVerified) return;
+    window.__MMX_TUTORIAL_COMPAT__ = "checking data";
+    verifiedTutorialData().then(function (matches) {
+      if (!matches) {
+        window.__MMX_TUTORIAL_COMPAT__ = "unavailable";
+        console.warn("[dataloader] Tutorial transition workaround disabled: game data differs from the supported build.");
+        return;
+      }
+      window.__MMX_TUTORIAL_COMPAT__ = "active";
+      // This engine uses Asyncify rather than Emscripten's preMainLoop, so a
+      // lightweight timer observes the pending transition between engine ticks.
+      setInterval(createTutorialTransitionWatcher(), 16);
+    }).catch(function (error) {
+      window.__MMX_TUTORIAL_COMPAT__ = "unavailable";
+      console.warn("[dataloader] Tutorial transition workaround could not check game data:", error);
+    });
+  });
+  Module.postRun.push(function () {
     console.log("[dataloader] postRun fired, engine ready");
     if (ui.overlay) ui.overlay.style.display = "none";
     document.body.classList.add("engine-ready");
   });
 
+  // Fetch/hash the small engine in parallel with the much larger data package.
+  // If verification fails, the normal Emscripten fetch still handles startup.
+  var tutorialEngineCandidate = verifiedTutorialEngine();
   window.__dataloaderReady = (async function () {
     try {
       var result = await resolveDataPackage();
@@ -472,8 +627,12 @@
       }
 
       var wasmBytes = await tryLoadGzippedWasm();
+      var verifiedBytes = await tutorialEngineCandidate;
       if (wasmBytes) {
         Module.wasmBinary = wasmBytes;
+      } else if (verifiedBytes && !Module.wasmBinary && !Module.instantiateWasm && !Module.locateFile) {
+        Module.wasmBinary = verifiedBytes;
+        tutorialEngineVerified = true;
       }
 
       var prevLocateFile = Module.locateFile;
