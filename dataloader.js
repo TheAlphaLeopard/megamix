@@ -154,20 +154,36 @@
     return out;
   }
 
-  async function buildBlobFromManifest(manifest) {
-    var totalBytes = manifest.totalSize || 0;
-    var assembled = new Uint8Array(totalBytes);
-    var written = 0;
+  async function buildPackageFromManifest(manifest) {
+    var totalBytes = manifest.totalSize;
+    if (!Number.isSafeInteger(totalBytes) || totalBytes <= 0) {
+      throw new Error("manifest has an invalid total size");
+    }
+    var expectedBytes = 0;
     for (var i = 0; i < manifest.parts.length; i++) {
       var part = manifest.parts[i];
-      setStatus("downloading part " + (i + 1) + "/" + manifest.parts.length + ": " + part.name);
-      var bytes = await fetchWithProgress(mmxJoin(part.name), function (loaded, total) {
+      if (!part || typeof part.name !== "string" || !part.name ||
+          !Number.isSafeInteger(part.size) || part.size <= 0) {
+        throw new Error("manifest has an invalid part at index " + i);
+      }
+      expectedBytes += part.size;
+    }
+    if (expectedBytes !== totalBytes) {
+      throw new Error("manifest part sizes do not match its total size");
+    }
+
+    var assembled = new Uint8Array(totalBytes);
+    var written = 0;
+    for (var j = 0; j < manifest.parts.length; j++) {
+      var currentPart = manifest.parts[j];
+      setStatus("downloading part " + (j + 1) + "/" + manifest.parts.length + ": " + currentPart.name);
+      var bytes = await fetchWithProgress(mmxJoin(currentPart.name), function (loaded) {
         setProgress(written + loaded, totalBytes);
-      }, part.size);
-      if (part.size && bytes.byteLength !== part.size) {
+      }, currentPart.size);
+      if (bytes.byteLength !== currentPart.size) {
         throw new Error(
-          "chunk size mismatch for " + part.name +
-          " (expected " + part.size + " bytes, got " + bytes.byteLength + ")"
+          "chunk size mismatch for " + currentPart.name +
+          " (expected " + currentPart.size + " bytes, got " + bytes.byteLength + ")"
         );
       }
       assembled.set(bytes, written);
@@ -175,11 +191,10 @@
     }
     setProgress(totalBytes, totalBytes);
     setStatus(DATA_FILE + " assembled (" + (totalBytes / 1048576).toFixed(1) + " MB), starting engine...");
-    var blob = new Blob([assembled], { type: "application/octet-stream" });
-    return URL.createObjectURL(blob);
+    return assembled.buffer;
   }
 
-  async function resolveDataUrl() {
+  async function resolveDataPackage() {
     setupUI();
 
     if (dataOverride) {
@@ -194,14 +209,13 @@
             " MB"
         );
       });
-      var blob = new Blob([bytes], { type: "application/octet-stream" });
-      return URL.createObjectURL(blob);
+      return { data: bytes.buffer };
     }
 
     setStatus("locating " + DATA_FILE + "...");
     if (await headOk(mmxJoin(DIRECT_DATA_URL))) {
       setStatus(DATA_FILE + " ready, starting engine...");
-      return DIRECT_DATA_URL;
+      return { url: mmxJoin(DIRECT_DATA_URL) };
     }
 
     if (await headOk(mmxJoin(DATA_MANIFEST_URL))) {
@@ -210,7 +224,7 @@
       if (!manifest || !Array.isArray(manifest.parts) || manifest.parts.length === 0) {
         throw new Error("manifest is empty or malformed");
       }
-      return await buildBlobFromManifest(manifest);
+      return { data: await buildPackageFromManifest(manifest) };
     }
 
     throw new Error("neither " + DATA_FILE + " nor " + DATA_MANIFEST_URL + " was reachable");
@@ -274,11 +288,39 @@
     if (m && parseFloat(m[2]) > 0) setProgress(parseFloat(m[1]), parseFloat(m[2]));
   };
 
+  Module.preRun = Module.preRun || [];
+
+  /* The bundled KBH Games build asks its JavaScript glue for the page URL.
+   * On other hosts it calls a KBH-only site check and blanks the game when the
+   * check fails. Use the build's existing offline/local mode instead. This
+   * changes only the URL returned to that engine callback: the browser's real
+   * origin, asset URLs and network requests are not changed. No request is
+   * made to the loopback address.
+   *
+   * 399590 is specific to the checked-in RSDKv5U.js/wasm pair. Check the
+   * callback before replacing it so a different engine build is not patched
+   * accidentally; review this hook and run the browser smoke test if updating
+   * either engine file. */
+  Module.preRun.push(function () {
+    var callbacks = window.ASM_CONSTS;
+    var getPageUrl = callbacks && callbacks[399590];
+    if (typeof getPageUrl !== "function" || typeof Module.stringToUTF8 !== "function" ||
+        getPageUrl.toString().indexOf("location.href") === -1 ||
+        getPageUrl.toString().indexOf("stringToUTF8") === -1) {
+      console.warn("[dataloader] Engine URL compatibility hook not found; check that RSDKv5U.js and .wasm match this loader.");
+      return;
+    }
+    callbacks[399590] = function (ptr, capacity) {
+      var localUrl = "http://127.0.0.1/".slice(0, Math.max(0, capacity - 1));
+      Module.stringToUTF8(localUrl, ptr, capacity);
+      return localUrl.length;
+    };
+  });
+
   /* --- IDBFS save persistence ---
    * Sonic Mania writes UserDB and save files to its working directory. We mount
    * IndexedDB-backed storage at /idbfs so writes survive tab close. Engine sees
    * a regular filesystem; FS.syncfs flushes to IndexedDB on intervals. */
-  Module.preRun = Module.preRun || [];
   Module.preRun.push(function () {
     if (qs.get("noidbfs")) {
       console.log("[dataloader] noidbfs=1 set, skipping IDBFS mount entirely");
@@ -402,8 +444,32 @@
 
   window.__dataloaderReady = (async function () {
     try {
-      var url = await resolveDataUrl();
+      var result = await resolveDataPackage();
+      var url = result.url || mmxJoin(DIRECT_DATA_URL);
       window.__RSDKv5_data_url = url;
+
+      if (result.data) {
+        /* Emscripten can consume the assembled ArrayBuffer directly. Creating a
+         * blob URL here would make it fetch and copy the 236 MiB package again,
+         * needlessly increasing peak memory, especially on smaller devices. */
+        var packageBuffer = result.data;
+        result.data = null;
+        var prevGetPreloadedPackage = Module.getPreloadedPackage;
+        Module.getPreloadedPackage = function (name, expectedSize) {
+          if (packageBuffer && name === url) {
+            if (packageBuffer.byteLength !== expectedSize) {
+              throw new Error("game data size does not match the engine (expected " +
+                expectedSize + " bytes, got " + packageBuffer.byteLength + ")");
+            }
+            var buffer = packageBuffer;
+            packageBuffer = null;
+            return buffer;
+          }
+          return typeof prevGetPreloadedPackage === "function"
+            ? prevGetPreloadedPackage(name, expectedSize)
+            : null;
+        };
+      }
 
       var wasmBytes = await tryLoadGzippedWasm();
       if (wasmBytes) {

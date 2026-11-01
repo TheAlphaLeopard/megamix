@@ -228,18 +228,23 @@
         statusEl.classList.toggle("err", !!isErr);
       }
 
-      function showEngineError(msg) {
-        if (!msg || document.body.classList.contains("engine-ready")) return;
+      function showEngineError(msg, fatal) {
+        if (!msg || (!fatal && document.body.classList.contains("engine-ready"))) return;
+        if (fatal) {
+          document.body.classList.remove("engine-ready");
+          var overlay = document.getElementById("loader-overlay");
+          if (overlay) overlay.style.display = "flex";
+        }
         var t = String(msg);
         if (t.length > 400) t = t.slice(0, 400) + "\u2026";
         setStatus("Engine error:\n" + t, true);
       }
       window.addEventListener("error", function (e) {
-        showEngineError(e && e.message ? e.message : e);
+        showEngineError(e && e.message ? e.message : e, true);
       });
       window.addEventListener("unhandledrejection", function (e) {
         var r = e && e.reason;
-        showEngineError(r && r.message ? r.message : r);
+        showEngineError(r && r.message ? r.message : r, true);
       });
 
       function fitCanvasToViewport() {
@@ -420,7 +425,7 @@
                 showEngineError(text);
               };
               window.Module.onAbort = function (text) {
-                showEngineError("Engine aborted: " + (text || "unknown reason"));
+                showEngineError("Engine aborted: " + (text || "unknown reason"), true);
               };
             }
             var eng = document.createElement("script");
