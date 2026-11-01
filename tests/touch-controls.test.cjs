@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 
-for (const name of ['index.html', 'cdn.html']) {
+for (const name of ['index.html', 'cdn.html', 'loader.svg']) {
   test(`${name} keeps jump, back, and pause as separate touch buttons`, () => {
     const html = fs.readFileSync(path.join(__dirname, '..', name), 'utf8');
     assert.match(html, /class="tc-btn btn-a" data-key="a"/);

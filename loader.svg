@@ -52,16 +52,10 @@
         });
     } catch(e) { console.warn('[shim] head override failed:', e); }
 
-    // 4. Force body existence now (some browsers cache the null)
-    if (!document.body) {
-        var existing = document.querySelector('body');
-        if (!existing) {
-            var html = document.querySelector('html');
-            if (html) existing = html.appendChild(document.createElement('body'));
-        }
-    }
+    // The parser has not reached <body> yet. Do not create one here: a second
+    // body would be parsed below, leaving controls outside document.body.
 
-    // 5. innerHTML setter bridge: parse as HTML, import as nodes
+    // 4. innerHTML setter bridge: parse as HTML, import as nodes
     try {
         var innerHTMLDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
         Object.defineProperty(Element.prototype, 'innerHTML', {
@@ -83,11 +77,8 @@
         });
     } catch(e) { console.warn('[shim] innerHTML override failed:', e); }
 
-    console.log('[shim] document.body =', document.body ? document.body.tagName : 'NULL');
-    console.log('[shim] document.head =', document.head ? document.head.tagName : 'NULL');
 })();
 //]]></script>
-<link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800&#38;display=swap" rel="stylesheet"/>
 <style><![CDATA[
       html, body {
         margin: 0;
@@ -248,6 +239,15 @@
       .face-buttons .btn-y { top: 0;    left: 60px; }
       .face-buttons .btn-a { bottom: 0; left: 0;   }
       .face-buttons .btn-b { bottom: 0; right: 0;  }
+      .btn-start {
+        top: calc(16px + env(safe-area-inset-top));
+        left: 50%;
+        transform: translateX(-50%);
+        width: 76px;
+        height: 36px;
+        border-radius: 18px;
+        font-size: 12px;
+      }
 ]]></style>
 </head>
 <body>
@@ -264,6 +264,7 @@
     <button id="fs-btn" title="Toggle fullscreen" aria-label="Toggle fullscreen">&#x26F6;</button>
 
     <div id="touch-controls" aria-hidden="true">
+      <button class="tc-btn btn-start" data-key="Enter">START</button>
       <div class="dpad">
         <button class="tc-btn up"    data-key="ArrowUp">&#x25B2;</button>
         <button class="tc-btn down"  data-key="ArrowDown">&#x25BC;</button>
@@ -271,42 +272,22 @@
         <button class="tc-btn right" data-key="ArrowRight">&#x25B6;</button>
       </div>
       <div class="face-buttons">
-        <button class="tc-btn btn-a" data-key="a,Enter">A</button>
-        <button class="tc-btn btn-b" data-key="s,Escape">B</button>
+        <button class="tc-btn btn-a" data-key="a">A</button>
+        <button class="tc-btn btn-b" data-key="s">B</button>
         <button class="tc-btn btn-y" data-key="d">Y</button>
       </div>
     </div>
 
 <script><![CDATA[
-      /* This SVG must live in the SAME directory as the game files
-       * (dataloader.js, RSDKv5U.js, RSDKv5U.data.manifest.json, chunks/).
-       * Everything is fetched relative to the SVG's own URL, so it works
-       * straight from jsDelivr, GitHub Pages, or any static host — no config. */
+      /* Open this SVG as a document, alongside the game files. Relative URLs
+       * keep the jsDelivr URL, GitHub Pages, and local static hosts working. */
       var CDN_BASE = "";
       window.__MMX_BASE__ = CDN_BASE;
 
-      /* --- [mmx] engine call-home shim -------------------------------------
-       * The engine binary phones home to https://kdata1.com/api/... as part
-       * of a signed license handshake. That server only sends
-       * Access-Control-Allow-Origin: https://kdata1.com, so from any other
-       * origin the request is CORS-blocked (console errors + a failed
-       * handshake). Answering it locally with an empty 204 keeps the engine
-       * happy and the console clean; no data ever leaves the browser.
-       * -------------------------------------------------------------------- */
-      (function () {
-        var origFetch = window.fetch ? window.fetch.bind(window) : null;
-        if (!origFetch) return;
-        window.fetch = function (input, init) {
-          try {
-            var url = typeof input === "string" ? input : (input && input.url) || "";
-            if (/^https?:\/\/([^\/]*\.)?kdata1\.com\/api\//i.test(url)) {
-              return Promise.resolve(
-                new Response("", { status: 200, statusText: "OK" }));
-            }
-          } catch (e) { /* fall through to real fetch */ }
-          return origFetch(input, init);
-        };
-      })();
+      /* Change this to the first 12 hex digits of dataloader.js's SHA-256 when
+       * updating that file. The query gives browsers a fresh cache key for the
+       * startup and tutorial fixes; it does not purge jsDelivr's edge cache. */
+      var DATALOADER_REVISION = "cb7e54fcc52e";
 
       var fsBtn = document.getElementById("fs-btn");
       var canvas = document.getElementById("canvas");
@@ -318,18 +299,23 @@
         statusEl.classList.toggle("err", !!isErr);
       }
 
-      function showEngineError(msg) {
-        if (!msg || document.body.classList.contains("engine-ready")) return;
+      function showEngineError(msg, fatal) {
+        if (!msg || (!fatal && document.body.classList.contains("engine-ready"))) return;
+        if (fatal) {
+          document.body.classList.remove("engine-ready");
+          var overlay = document.getElementById("loader-overlay");
+          if (overlay) overlay.style.display = "flex";
+        }
         var t = String(msg);
         if (t.length > 400) t = t.slice(0, 400) + "\u2026";
         setStatus("Engine error:\n" + t, true);
       }
       window.addEventListener("error", function (e) {
-        showEngineError(e && e.message ? e.message : e);
+        showEngineError(e && e.message ? e.message : e, true);
       });
       window.addEventListener("unhandledrejection", function (e) {
         var r = e && e.reason;
-        showEngineError(r && r.message ? r.message : r);
+        showEngineError(r && r.message ? r.message : r, true);
       });
 
       function fitCanvasToViewport() {
@@ -371,7 +357,9 @@
       if (isTouchDevice()) document.body.classList.add("touch-mode");
 
       fsBtn.addEventListener("click", function () {
-        var target = canvas;
+        // Fullscreen the SVG, not just the canvas, so touch controls remain
+        // available and the fullscreen button can still be used to exit.
+        var target = document.documentElement;
         if (document.fullscreenElement) {
           document.exitFullscreen().catch(function () {});
         } else if (target.requestFullscreen) {
@@ -475,7 +463,7 @@
 
         setStatus("Loading game loader\u2026");
         var dl = document.createElement("script");
-        dl.src = CDN_BASE + "dataloader.js";
+        dl.src = CDN_BASE + "dataloader.js?v=" + DATALOADER_REVISION;
         dl.onerror = function () {
           setStatus("Could not load dataloader.js from:\n" + dl.src + "\n\nMake sure this SVG sits in the same directory as the game files.", true);
         };
@@ -494,7 +482,7 @@
                 showEngineError(text);
               };
               window.Module.onAbort = function (text) {
-                showEngineError("Engine aborted: " + (text || "unknown reason"));
+                showEngineError("Engine aborted: " + (text || "unknown reason"), true);
               };
             }
             var eng = document.createElement("script");
